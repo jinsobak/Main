@@ -225,12 +225,12 @@ function Open-ComparePage {
     $originUrl = Get-RemoteUrl -Repo $Repo -Remote "origin"
     $originOwner = Get-GitHubOwner -Url $originUrl
 
-    if ($baseRemote -eq "upstream" -and $originOwner) {
-        $compare = "$baseUrl/compare/$BaseBranch...$originOwner`:$Branch?expand=1"
-    }
-    else {
-        $compare = "$baseUrl/compare/$BaseBranch...$Branch?expand=1"
-    }
+if ($baseRemote -eq "upstream" -and $originOwner) {
+    $compare = "{0}/compare/{1}...{2}:{3}?expand=1" -f $baseUrl, $BaseBranch, $originOwner, $Branch
+}
+else {
+    $compare = "{0}/compare/{1}...{2}?expand=1" -f $baseUrl, $BaseBranch, $Branch
+}
 
     Write-Host "[BROWSER] $compare"
     Start-Process $compare
