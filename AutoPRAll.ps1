@@ -1,8 +1,11 @@
-﻿param(
-    [string]$RepoListPath = "$PSScriptRoot\repo_list.txt"
+param(
+    [string]$RootPath = $PSScriptRoot,
+    [int]$MaxDepth = 8,
+    [switch]$NoAutoTrustSafeDirectory
 )
 
 $ErrorActionPreference = "Continue"
+$env:GIT_PAGER = ""
 
 function Write-Section($text) {
     Write-Host ""
@@ -14,9 +17,12 @@ function Write-Section($text) {
 function Test-GitInstalled {
     $git = Get-Command git -ErrorAction SilentlyContinue
     if ($null -eq $git) {
-        Write-Host "[ERROR] git 명령을 찾을 수 없습니다. Git for Windows 설치 또는 PATH 등록이 필요합니다." -ForegroundColor Red
+        Write-Host "[ERROR] git command was not found. Check Git for Windows or PATH." -ForegroundColor Red
         return $false
     }
+
+    $ver = & git --version 2>&1
+    Write-Host "[GIT] $ver"
     return $true
 }
 
@@ -32,7 +38,26 @@ function Invoke-Git {
         [switch]$Quiet
     )
 
-    $output = & git -C $Repo @Args 2>&1
+    $output = & git --no-pager -C $Repo @Args 2>&1
+    $code = $LASTEXITCODE
+
+    if (-not $Quiet -and $output) {
+        $output | ForEach-Object { Write-Host $_ }
+    }
+
+    return [PSCustomObject]@{
+        Code = $code
+        Output = @($output)
+    }
+}
+
+function Invoke-GitGlobal {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$Args,
+        [switch]$Quiet
+    )
+
+    $output = & git --no-pager @Args 2>&1
     $code = $LASTEXITCODE
 
     if (-not $Quiet -and $output) {
@@ -63,43 +88,168 @@ function Invoke-Gh {
     }
 }
 
-function Get-RepoCandidates {
-    param([string]$ListPath)
+function Test-DubiousOwnershipMessage {
+    param([object[]]$Output)
 
-    if (Test-Path $ListPath) {
-        $lines = [System.IO.File]::ReadAllLines($ListPath, [System.Text.Encoding]::UTF8)
-        $result = New-Object System.Collections.Generic.List[string]
+    $text = ($Output | ForEach-Object { $_.ToString() }) -join "`n"
+    return (
+        $text -match "dubious ownership" -or
+        $text -match "safe\.directory" -or
+        $text -match "detected dubious ownership"
+    )
+}
 
-        foreach ($line in $lines) {
-            $trimmed = $line.Trim()
-            if ([string]::IsNullOrWhiteSpace($trimmed)) { continue }
-            if ($trimmed.StartsWith("#")) { continue }
-            $trimmed = $trimmed.Trim('"')
-            $result.Add($trimmed)
-        }
+function Add-SafeDirectory {
+    param([string]$RepoPath)
 
-        return @($result)
+    if ($NoAutoTrustSafeDirectory) {
+        Write-Host "[SAFE DIR] Auto trust disabled. Skipping safe.directory registration." -ForegroundColor Yellow
+        return $false
     }
 
-    return @((Get-Location).Path)
+    Write-Host "[SAFE DIR] Registering safe.directory: $RepoPath" -ForegroundColor Yellow
+    $add = Invoke-GitGlobal -Args @("config", "--global", "--add", "safe.directory", $RepoPath)
+    return ($add.Code -eq 0)
+}
+
+function Get-RepoCandidates {
+    param(
+        [string]$Root,
+        [int]$MaxDepth = 8
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Root)) {
+        $Root = (Get-Location).Path
+    }
+
+    if (-not (Test-Path -LiteralPath $Root)) {
+        Write-Host "[ERROR] RootPath does not exist: $Root" -ForegroundColor Red
+        return @()
+    }
+
+    $rootFullPath = (Resolve-Path -LiteralPath $Root).Path
+
+    Write-Host "[ROOT] auto scan root: $rootFullPath"
+    Write-Host "[SCAN] searching child Git repositories..."
+
+    $skipFolderNames = @(
+        ".git",
+        "Library",
+        "Temp",
+        "Obj",
+        "obj",
+        "Build",
+        "Builds",
+        "Logs",
+        ".vs",
+        ".idea",
+        "node_modules"
+    )
+
+    $result = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
+    $queue = New-Object System.Collections.Generic.Queue[object]
+    $queue.Enqueue([PSCustomObject]@{
+        Path = $rootFullPath
+        Depth = 0
+    })
+
+    while ($queue.Count -gt 0) {
+        $current = $queue.Dequeue()
+        $dir = $current.Path
+        $depth = [int]$current.Depth
+
+        if ($depth -gt $MaxDepth) {
+            continue
+        }
+
+        $gitMarker = Join-Path $dir ".git"
+
+        if (Test-Path -LiteralPath $gitMarker) {
+            $key = $dir.ToLowerInvariant()
+
+            if (-not $seen.ContainsKey($key)) {
+                $seen[$key] = $true
+                $result.Add($dir)
+            }
+        }
+
+        $children = Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction SilentlyContinue
+
+        foreach ($child in $children) {
+            if ($skipFolderNames -contains $child.Name) {
+                continue
+            }
+
+            $queue.Enqueue([PSCustomObject]@{
+                Path = $child.FullName
+                Depth = $depth + 1
+            })
+        }
+    }
+
+    if ($result.Count -eq 0) {
+        Write-Host "[WARN] no Git repositories found." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "[FOUND] Git repositories: $($result.Count)"
+        foreach ($repo in $result) {
+            Write-Host " - $repo"
+        }
+    }
+
+    return @($result)
 }
 
 function Resolve-GitRoot {
     param([string]$Path)
 
-    if (-not (Test-Path $Path)) {
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Host "[SKIP] path does not exist: $Path" -ForegroundColor Yellow
         return $null
     }
 
-    $resolvedPath = (Resolve-Path $Path).Path
+    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+
     $inside = Invoke-Git -Repo $resolvedPath -Args @("rev-parse", "--is-inside-work-tree") -Quiet
 
+    if ($inside.Code -ne 0 -and (Test-DubiousOwnershipMessage -Output $inside.Output)) {
+        Write-Host "[WARN] Git rejected this repo because of safe.directory / ownership." -ForegroundColor Yellow
+        $ok = Add-SafeDirectory -RepoPath $resolvedPath
+
+        if ($ok) {
+            $inside = Invoke-Git -Repo $resolvedPath -Args @("rev-parse", "--is-inside-work-tree") -Quiet
+        }
+    }
+
     if ($inside.Code -ne 0) {
+        Write-Host "[SKIP] git rev-parse failed: $resolvedPath" -ForegroundColor Yellow
+        if ($inside.Output.Count -gt 0) {
+            Write-Host "[GIT OUTPUT]"
+            $inside.Output | ForEach-Object { Write-Host $_ }
+        }
+        return $null
+    }
+
+    $insideText = ""
+    if ($inside.Output.Count -gt 0) {
+        $insideText = $inside.Output[0].ToString().Trim().ToLowerInvariant()
+    }
+
+    if ($insideText -ne "true") {
+        Write-Host "[SKIP] not inside Git work tree: $resolvedPath" -ForegroundColor Yellow
         return $null
     }
 
     $root = Invoke-Git -Repo $resolvedPath -Args @("rev-parse", "--show-toplevel") -Quiet
+
     if ($root.Code -ne 0 -or $root.Output.Count -eq 0) {
+        Write-Host "[SKIP] failed to resolve Git root: $resolvedPath" -ForegroundColor Yellow
+        if ($root.Output.Count -gt 0) {
+            Write-Host "[GIT OUTPUT]"
+            $root.Output | ForEach-Object { Write-Host $_ }
+        }
         return $null
     }
 
@@ -212,25 +362,25 @@ function Open-ComparePage {
     $remotes = Get-Remotes -Repo $Repo
     $baseRemote = if ($remotes -contains "upstream") { "upstream" } elseif ($remotes -contains "origin") { "origin" } else { $null }
     if (-not $baseRemote) {
-        Write-Host "[SKIP] remote가 없어 브라우저 PR 페이지를 열 수 없습니다."
+        Write-Host "[SKIP] no remote. Browser PR page cannot be opened."
         return
     }
 
     $baseUrl = ConvertTo-GitHubWebUrl -Url (Get-RemoteUrl -Repo $Repo -Remote $baseRemote)
     if (-not $baseUrl) {
-        Write-Host "[SKIP] GitHub URL을 해석하지 못했습니다."
+        Write-Host "[SKIP] failed to parse GitHub URL."
         return
     }
 
     $originUrl = Get-RemoteUrl -Repo $Repo -Remote "origin"
     $originOwner = Get-GitHubOwner -Url $originUrl
 
-if ($baseRemote -eq "upstream" -and $originOwner) {
-    $compare = "{0}/compare/{1}...{2}:{3}?expand=1" -f $baseUrl, $BaseBranch, $originOwner, $Branch
-}
-else {
-    $compare = "{0}/compare/{1}...{2}?expand=1" -f $baseUrl, $BaseBranch, $Branch
-}
+    if ($baseRemote -eq "upstream" -and $originOwner) {
+        $compare = "{0}/compare/{1}...{2}:{3}?expand=1" -f $baseUrl, $BaseBranch, $originOwner, $Branch
+    }
+    else {
+        $compare = "{0}/compare/{1}...{2}?expand=1" -f $baseUrl, $BaseBranch, $Branch
+    }
 
     Write-Host "[BROWSER] $compare"
     Start-Process $compare
@@ -244,7 +394,7 @@ function Push-CurrentBranch {
 
     $remotes = Get-Remotes -Repo $Repo
     if (-not ($remotes -contains "origin")) {
-        Write-Host "[ERROR] origin remote가 없습니다. fork workflow에서는 origin이 필요합니다." -ForegroundColor Red
+        Write-Host "[ERROR] no origin remote. Fork workflow requires origin." -ForegroundColor Red
         return $false
     }
 
@@ -280,19 +430,19 @@ function Get-AheadCount {
 }
 
 if (-not (Test-GitInstalled)) {
-    Read-Host "종료하려면 Enter"
+    Read-Host "Press Enter to exit"
     exit 1
 }
 
 $hasGh = Test-GhInstalled
 if ($hasGh) {
-    Write-Host "[INFO] GitHub CLI(gh)를 찾았습니다. PR 생성에 gh를 우선 사용합니다."
+    Write-Host "[INFO] GitHub CLI found. gh pr create will be used first."
 }
 else {
-    Write-Host "[INFO] GitHub CLI(gh)가 없습니다. PR 생성 시 브라우저 compare 페이지를 엽니다."
+    Write-Host "[INFO] GitHub CLI not found. Browser compare page will be opened for PR creation."
 }
 
-$candidates = Get-RepoCandidates -ListPath $RepoListPath
+$candidates = Get-RepoCandidates -Root $RootPath -MaxDepth $MaxDepth
 $seen = @{}
 
 foreach ($candidate in $candidates) {
@@ -301,13 +451,12 @@ foreach ($candidate in $candidates) {
     $root = Resolve-GitRoot -Path $candidate
 
     if (-not $root) {
-        Write-Host "[SKIP] Git 작업트리가 아닙니다. 경로를 확인하세요."
         continue
     }
 
     $key = $root.ToLowerInvariant()
     if ($seen.ContainsKey($key)) {
-        Write-Host "[SKIP] 이미 처리한 repo입니다: $root"
+        Write-Host "[SKIP] already processed repo: $root"
         continue
     }
     $seen[$key] = $true
@@ -316,7 +465,7 @@ foreach ($candidate in $candidates) {
 
     $branch = Get-CurrentBranch -Repo $root
     if (-not $branch) {
-        Write-Host "[SKIP] detached HEAD 상태입니다. 브랜치를 체크아웃한 뒤 다시 실행하세요." -ForegroundColor Yellow
+        Write-Host "[SKIP] detached HEAD. Checkout a branch first." -ForegroundColor Yellow
         continue
     }
 
@@ -329,12 +478,12 @@ foreach ($candidate in $candidates) {
     Write-Host "[BASE] $baseRemote/$baseBranch"
 
     if ($branch -in @("main", "master", "develop")) {
-        Write-Host "[WARN] 현재 브랜치가 $branch 입니다. PR용 작업 브랜치를 만드는 것을 추천합니다." -ForegroundColor Yellow
-        $newBranch = Read-Host "새 브랜치를 만들까요? 브랜치명을 입력하거나 Enter로 그대로 진행"
+        Write-Host "[WARN] current branch is $branch. A PR branch is recommended." -ForegroundColor Yellow
+        $newBranch = Read-Host "Create a new branch? Type branch name or press Enter to continue"
         if (-not [string]::IsNullOrWhiteSpace($newBranch)) {
             $create = Invoke-Git -Repo $root -Args @("switch", "-c", $newBranch)
             if ($create.Code -ne 0) {
-                Write-Host "[SKIP] 브랜치 생성 실패."
+                Write-Host "[SKIP] branch creation failed."
                 continue
             }
             $branch = $newBranch
@@ -351,13 +500,13 @@ foreach ($candidate in $candidates) {
         Write-Host "[DIFF SUMMARY]"
         Invoke-Git -Repo $root -Args @("diff", "--stat")
 
-        $ansCommit = Read-Host "이 변경사항을 commit할까요? [y/N]"
+        $ansCommit = Read-Host "Commit these changes? [y/N]"
         if ($ansCommit -notmatch "^[Yy]") {
-            Write-Host "[SKIP] 사용자가 commit을 선택하지 않았습니다."
+            Write-Host "[SKIP] user did not choose commit."
             continue
         }
 
-        $msg = Read-Host "커밋 메시지 입력"
+        $msg = Read-Host "Commit message"
         if ([string]::IsNullOrWhiteSpace($msg)) {
             $stamp = Get-Date -Format "yyyy-MM-dd HH:mm"
             $msg = "Auto PR update $stamp"
@@ -365,66 +514,66 @@ foreach ($candidate in $candidates) {
 
         $add = Invoke-Git -Repo $root -Args @("add", "-A")
         if ($add.Code -ne 0) {
-            Write-Host "[SKIP] git add 실패."
+            Write-Host "[SKIP] git add failed."
             continue
         }
 
         $commit = Invoke-Git -Repo $root -Args @("commit", "-m", $msg)
         if ($commit.Code -ne 0) {
-            Write-Host "[WARN] commit 실패 또는 커밋할 변경사항 없음."
+            Write-Host "[WARN] commit failed or no changes to commit."
         }
     }
     else {
-        Write-Host "[CLEAN] 로컬 변경사항 없음."
+        Write-Host "[CLEAN] no local changes."
     }
 
     $ahead = Get-AheadCount -Repo $root -Branch $branch
     if ($ahead -le 0) {
-        Write-Host "[SKIP] origin/$branch 로 보낼 커밋이 없습니다."
+        Write-Host "[SKIP] no commits to push to origin/$branch."
         continue
     }
 
-    $ansPush = Read-Host "origin/$branch 로 push할까요? [y/N]"
+    $ansPush = Read-Host "Push to origin/$branch? [y/N]"
     if ($ansPush -notmatch "^[Yy]") {
-        Write-Host "[SKIP] push를 건너뜁니다."
+        Write-Host "[SKIP] push skipped."
         continue
     }
 
     $pushed = Push-CurrentBranch -Repo $root -Branch $branch
     if (-not $pushed) {
-        Write-Host "[SKIP] push 실패. PR 생성을 건너뜁니다."
+        Write-Host "[SKIP] push failed. PR creation skipped."
         continue
     }
 
-    $title = Read-Host "PR 제목 입력"
+    $title = Read-Host "PR title"
     if ([string]::IsNullOrWhiteSpace($title)) {
         $title = "Auto PR: $branch"
     }
 
-    $body = Read-Host "PR 설명 입력. Enter면 기본 설명 사용"
+    $body = Read-Host "PR body. Press Enter for default"
     if ([string]::IsNullOrWhiteSpace($body)) {
         $body = "Auto-created PR from $branch."
     }
 
-    $ansPr = Read-Host "PR을 만들까요? [y/N]"
+    $ansPr = Read-Host "Create PR? [y/N]"
     if ($ansPr -notmatch "^[Yy]") {
-        Write-Host "[SKIP] PR 생성을 건너뜁니다."
+        Write-Host "[SKIP] PR creation skipped."
         continue
     }
 
     if ($hasGh) {
-        Write-Host "[GH] gh pr create 시도 중..."
+        Write-Host "[GH] trying gh pr create..."
         $gh = Invoke-Gh -Repo $root -Args @("pr", "create", "--base", $baseBranch, "--head", $branch, "--title", $title, "--body", $body)
         if ($gh.Code -eq 0) {
-            Write-Host "[OK] PR 생성 완료." -ForegroundColor Green
+            Write-Host "[OK] PR created." -ForegroundColor Green
             continue
         }
 
-        Write-Host "[WARN] gh pr create 실패. 브라우저 compare 페이지를 엽니다." -ForegroundColor Yellow
+        Write-Host "[WARN] gh pr create failed. Opening browser compare page." -ForegroundColor Yellow
     }
 
     Open-ComparePage -Repo $root -Branch $branch -BaseBranch $baseBranch
 }
 
 Write-Host ""
-Write-Host "전체 PR 처리 완료."
+Write-Host "All PR jobs completed."
